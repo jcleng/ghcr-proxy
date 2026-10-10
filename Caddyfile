@@ -1,14 +1,29 @@
 # ghcr.io 反向代理（Docker Registry pull-through proxy）
 #
-# 用途：让 Docker 通过 http://<host>:5999/<owner>/<image>:<tag> 拉取 ghcr.io 镜像
-# 例：ghcr.io/jcleng/opencode-free-provider:latest
-#  -> 134.175.61.80:5999/jcleng/opencode-free-provider:latest
+# 用途：让 Docker 通过本代理拉取 ghcr.io 镜像
 #
-# 关键点：ghcr.io 返回 401 时带有 WWW-Authenticate: Bearer realm="https://ghcr.io/token"
-# 若不改写，客户端会直接去访问 https://ghcr.io/token（绕过代理）。
-# 因此把 realm 重写为本代理地址，让 token 请求也走代理。
+#   原始：  ghcr.io/jcleng/opencode-free-provider:latest
+#   HTTPS： 134.175.61.80:5999/jcleng/opencode-free-provider:latest   ← 推荐，Docker 默认走 HTTPS
+#   HTTP：  134.175.61.80:5998/jcleng/opencode-free-provider:latest   ← 仅供已配置 insecure-registries 的客户端
+#
+# 关键点 1：Docker 默认只信任 HTTPS 仓库。若代理只提供 HTTP，客户端会报
+#           "http: server gave HTTP response to HTTPS client"。
+#           因此主监听端口使用 TLS。
+#
+#           默认使用 Caddy 内置 CA 自签证书，客户端只需安装 CA 证书即可，
+#           无需修改 docker/daemon.json：
+#             /etc/docker/certs.d/<host:port>/ca.crt
+#           （CA 证书在容器内 /data/caddy/pki/authorities/local/root.crt）
+#
+#           若你有真实域名，把下面的 `tls internal` 删掉、并把站点地址改成域名，
+#           Caddy 会自动申请 Let's Encrypt 证书，客户端则完全无需任何配置。
+#
+# 关键点 2：ghcr.io 返回 401 时带有
+#           WWW-Authenticate: Bearer realm="https://ghcr.io/token",...
+#           若不改写，客户端会直接访问 https://ghcr.io/token（绕过代理）。
+#           因此把 realm 重写为本代理地址，让 token 请求也走代理。
 
-:5999 {
+(ghcr_proxy) {
 	# 1) token 端点：原样转发到 ghcr.io（ghcr.io 的 token 端点会忽略 service 参数，
 	#    因此即使客户端传 service=<本代理地址> 也能正常签发 token）
 	handle /token* {
@@ -21,9 +36,10 @@
 	handle {
 		reverse_proxy https://ghcr.io {
 			header_up Host ghcr.io
-			# 把上游的认证 realm 改写为本代理，保证 token 请求不绕过代理
-			# {http.request.hostport} 会保留端口（{http.request.host} 会丢端口，导致 401）
-			header_down WWW-Authenticate "https://ghcr.io/token" "http://{http.request.hostport}/token"
+			# 把上游认证 realm 改写为本代理，保证 token 请求不绕过代理。
+			# 用 {http.request.scheme} + {http.request.hostport} 同时兼容 HTTP/HTTPS 与端口
+			# （{http.request.host} 会丢端口，导致 401）
+			header_down WWW-Authenticate "https://ghcr.io/token" "{http.request.scheme}://{http.request.hostport}/token"
 		}
 	}
 
@@ -31,4 +47,17 @@
 		output stdout
 		format console
 	}
+}
+
+# 主监听：HTTPS（Docker 默认要求）
+# 可用环境变量 SITE_ADDR 覆盖站点地址，默认 134.175.61.80:5999
+{$SITE_ADDR:134.175.61.80:5999} {
+	tls internal
+	import ghcr_proxy
+}
+
+# 备用监听：HTTP（仅用于已配置 insecure-registries 的客户端，可选）
+# 可用环境变量 HTTP_ADDR 覆盖，默认 :5998
+http://{$HTTP_ADDR::5998} {
+	import ghcr_proxy
 }
