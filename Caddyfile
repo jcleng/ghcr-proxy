@@ -18,7 +18,7 @@
 # 因此本容器需要同时暴露 80/443 用于 ACME 验证，5999 用于镜像拉取。
 #
 # 如果你有域名，直接指向本机即可，改用 90 天证书、且无上述限制：
-#   把下面的 tls { ... } 整块删掉，并把站点地址换成域名（见 README「附录 B」）。
+#   把下面的 tls { ... } 整块删掉，并把 SITE_HOST 换成域名（见 README「附录 B」）。
 #
 # 关键点：ghcr.io 返回 401 时带有
 #         WWW-Authenticate: Bearer realm="https://ghcr.io/token",...
@@ -32,6 +32,19 @@
 	# ACME 服务器。调试时可改为 Let's Encrypt staging 以免触发速率限制：
 	#   -e ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory
 	acme_ca {$ACME_CA:https://acme-v02.api.letsencrypt.org/directory}
+
+	# ★ 必须设置，否则 `docker pull` 会失败！
+	#
+	# Docker 客户端用 Go 的 crypto/tls，对「IP 字面量」地址【不会发送 SNI】
+	# （TLS 规范禁止 SNI 携带 IP）。此时 Caddy 找不到 SNI，会退化为用
+	# 「连接的本地 IP」去匹配证书 —— 而容器内看到的本地 IP 是 172.x.x.x，
+	# 不是对外公布的 134.175.61.80，于是匹配不到证书，握手直接失败：
+	#
+	#     docker pull ... -> remote error: tls: internal error
+	#
+	# 而 curl / openssl / 浏览器测试时通常会带上 SNI，所以【手工测试正常、
+	# docker pull 却失败】。default_sni 让无 SNI 的连接回退到该名字取证书。
+	default_sni {$SITE_HOST:134.175.61.80}
 }
 
 (ghcr_proxy) {
@@ -60,10 +73,11 @@
 	}
 }
 
-# 站点地址：默认裸 IP + 5999 端口，可用 SITE_ADDR 覆盖
-#   -e SITE_ADDR=134.175.61.80:5999
+# 站点地址由 SITE_HOST + SITE_PORT 拼成，两者与上面的 default_sni 始终一致，
+# 不会出现「改了地址忘了改 SNI」导致 docker pull 失败的情况。
+#   -e SITE_HOST=134.175.61.80 -e SITE_PORT=5999
 # 若改成域名（如 ghcr.example.com），请同时删掉下面的 tls 块。
-{$SITE_ADDR:134.175.61.80:5999} {
+{$SITE_HOST:134.175.61.80}:{$SITE_PORT:5999} {
 	tls {
 		issuer acme {
 			# 裸 IP 证书被 Let's Encrypt 强制要求使用 shortlived profile

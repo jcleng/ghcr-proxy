@@ -84,6 +84,43 @@ docker run -d --name ghcr-proxy --restart unless-stopped \
 
 ## 二、原理（重要）
 
+### 2.0 为什么必须配置 `default_sni`（否则 `docker pull` 必失败）
+
+这是本项目最容易踩的坑，且现象具有欺骗性：**用 curl / openssl 测试一切正常，但 `docker pull` 报 `tls: internal error`。**
+
+原因：Docker 客户端用 Go 的 `crypto/tls`，对「**IP 字面量**」地址**不会发送 SNI**
+（TLS 规范本身就禁止 SNI 里携带 IP 地址）。而 curl/openssl 手工测试时通常会带上 SNI，于是表现不一致。
+
+Caddy 在收不到 SNI 时，会退化为用「**连接的本地 IP**」去匹配证书：
+
+```go
+// certmagic handshake.go: getCertificateFromCache
+if name == "" {
+    // if SNI is empty, prefer matching IP address
+    addr := localIPFromConn(hello.Conn)   // ← 容器内看到的是 172.x.x.x
+    cert, matched = cfg.selectCert(hello, addr)
+```
+
+容器内 `hello.Conn` 的本地地址是 `172.x.x.x`（docker 网桥），
+**不是**对外公布的 `134.175.61.80`，所以匹配不到证书，握手直接中断：
+
+```
+docker pull 134.175.61.80:5999/... → remote error: tls: internal error
+```
+
+解决办法是在全局块里设置 `default_sni`，让无 SNI 的连接回退到该名字取证书：
+
+```caddyfile
+{
+    default_sni {$SITE_HOST:134.175.61.80}
+}
+```
+
+> 用域名时通常不会碰到这个问题（域名会正常发送 SNI），但 `default_sni` 无害且能兼容
+> 「客户端不发送 SNI」的各种情况，所以保留。
+
+### 2.1 Registry 认证流程
+
 Docker 拉取镜像分两步：
 
 1. **请求 manifest**：`GET /v2/<owner>/<repo>/manifests/<tag>`
@@ -188,7 +225,8 @@ docker tag 134.175.61.80:5999/jcleng/opencode-free-provider:latest \
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `SITE_ADDR` | `134.175.61.80:5999` | 站点地址。改成域名即切换为域名证书 |
+| `SITE_HOST` | `134.175.61.80` | 对外主机名/IP。同时用于站点地址与 `default_sni` |
+| `SITE_PORT` | `5999` | 对外端口 |
 | `ACME_EMAIL` | `j.c.leng@foxmail.com` | ACME 账户邮箱，用于到期提醒/找回 |
 | `ACME_CA` | Let's Encrypt 生产 | 改成 `https://acme-staging-v02.api.letsencrypt.org/directory` 可先用测试环境调试 |
 | `ACME_PROFILE` | `shortlived` | 裸 IP 必须用 `shortlived`；用域名时应删除 tls 块而非改此项 |
@@ -282,7 +320,19 @@ X509v3 Subject Alternative Name:
     IP Address:134.175.61.80
 ```
 
-### 2. 服务是否起来
+### 2. 验证无 SNI 场景（模拟 Docker 的行为，最关键）
+
+因为 Docker 对 IP 字面量不发 SNI，**必须**用不带 `-servername` 的方式验证，
+否则会得到假阳性（curl/openssl 默认带 SNI，会掩盖问题）：
+
+```bash
+printf 'GET /v2/ HTTP/1.1\r\nHost: 134.175.61.80:5999\r\nConnection: close\r\n\r\n' \
+  | openssl s_client -quiet -connect 134.175.61.80:5999 2>/dev/null | head -1
+# 期望：HTTP/1.1 401 Unauthorized
+# 若报 "tlsv1 alert internal error" → default_sni 没生效，docker pull 必失败
+```
+
+### 3. 服务是否起来 + realm 改写
 
 ```bash
 curl -i https://134.175.61.80:5999/v2/
@@ -295,7 +345,7 @@ HTTP/2 401
 www-authenticate: Bearer realm="https://134.175.61.80:5999/token",service="ghcr.io",scope="..."
 ```
 
-### 3. 完整协议链路（token → manifest → blob）
+### 4. 完整协议链路（token → manifest → blob）
 
 ```bash
 REPO=jcleng/opencode-free-provider
@@ -309,11 +359,14 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
   "$BASE/v2/$REPO/manifests/latest" | grep -iE 'HTTP/|docker-content-digest'
 ```
 
-### 4. 真实拉取
+### 5. 真实拉取（唯一决定性验证）
 
 ```bash
-docker pull 134.175.61.80/jcleng/opencode-free-provider:latest
+docker pull 134.175.61.80:5999/jcleng/opencode-free-provider:latest
 ```
+
+> 这是**唯一**能真正验证成功的命令。前面用 curl/openssl 的检查都可能因为
+> 发送了 SNI 而“看起来正常”，但 `docker pull` 仍然失败（见第 2.0 节）。
 
 ---
 

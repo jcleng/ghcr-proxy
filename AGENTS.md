@@ -31,7 +31,13 @@
    极易触发 Let's Encrypt 速率限制。
 5. **realm 重写必须用 `{http.request.hostport}`**，不能用 `{http.request.host}`。
    后者会丢端口，导致 token 请求打到 `:443` 而失败。
-6. 本仓库**不需要**客户端改 `docker/daemon.json`，也不需要在拉取端安装 `ca.crt`。
+6. **必须设置 `default_sni`。** Docker 客户端用 Go `crypto/tls`，对「IP 字面量」
+   **不发 SNI**（TLS 规范禁止 SNI 带 IP）。Caddy 收不到 SNI 时会用「连接的本地 IP」
+   （容器内是 `172.x.x.x`）匹配证书，匹配不到则握手失败：
+   `docker pull → remote error: tls: internal error`。
+   **验证时不能只用 curl/openssl**（它们默认带 SNI，会掩盖问题），
+   必须用 `openssl s_client -quiet -connect host:port`（不带 `-servername`）或直接 `docker pull`。
+7. 本仓库**不需要**客户端改 `docker/daemon.json`，也不需要在拉取端安装 `ca.crt`。
    如果发现文档/配置里又出现这类要求，说明方案退化成了自签，需纠正。
 
 ---
@@ -143,6 +149,14 @@ docker run -d --name ghcr-proxy --restart unless-stopped \
 ```bash
 echo | openssl s_client -connect 134.175.61.80:5999 -servername 134.175.61.80 2>/dev/null \
   | openssl x509 -noout -issuer
+```
+
+**必须额外验证无 SNI 场景**（Docker 的真实行为，见第 2 节约束 6）：
+
+```bash
+printf 'GET /v2/ HTTP/1.1\r\nHost: 134.175.61.80:5999\r\nConnection: close\r\n\r\n' \
+  | openssl s_client -quiet -connect 134.175.61.80:5999 2>/dev/null | head -1
+# 期望 HTTP/1.1 401；若报 tlsv1 alert internal error，则 default_sni 未生效
 ```
 
 验证协议链路：
