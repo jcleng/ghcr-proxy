@@ -154,7 +154,17 @@ docker pull 134.175.61.80:5999/jcleng/opencode-free-provider:latest
 
 调试期可先用 Let's Encrypt staging 避免生产速率限制
 （`-e ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory`），
-但 staging 证书**不被 Docker 信任**，确认流程无误后须去掉该变量并删除 `ghcr-proxy-data` 卷重新申请。
+但 staging 证书**不被 Docker 信任**。
+
+**切回生产环境时必须删除 `/data` 卷**（`docker volume rm ghcr-proxy-data`），
+否则 Caddy 存储里已有 staging 证书，会直接复用而**不会**重新申请。
+
+### 速率限制要点（不要删卷重建）
+
+- 「New Certificates per Exact Set of Identifiers」= **5 次 / 7 天**，全局计算、不区分账户。
+- **ARI 续期豁免所有速率限制**，Caddy 2.11 默认走 ARI，所以 6 天证书长期运行不会撞限。
+- 因此正确做法是：**持久化 `/data` 卷，让 Caddy 自行续期**。
+  反复删卷重建 = 每次都算全新订单，7 天内 5 次就满。
 
 ---
 

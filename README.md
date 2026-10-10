@@ -200,15 +200,72 @@ docker run -d --name ghcr-proxy --restart unless-stopped \
   -p 80:80 -p 443:443 -p 5999:5999 \
   -v ghcr-proxy-data:/data \
   -e ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory \
-  ghcr-proxy:latest
+  registry.cn-hangzhou.aliyuncs.com/jcleng/gitbuild-ghcr-proxy:latest
 ```
 
 > 注意：staging 签发的证书**不被 Docker 信任**（浏览器/客户端会报 unknown authority）。
-> 只在调试时用，确认流程没问题后去掉该环境变量、删掉 `ghcr-proxy-data` 卷再重新申请。
+> 只在调试时用。**切换到生产环境时必须删掉 `/data` 卷**，否则 Caddy 会认为证书已存在
+> 而继续复用 staging 证书，不会重新申请（详见第七节「切换到生产环境」）。
+
+### 关于速率限制（`shortlived` 特别重要）
+
+裸 IP 证书有效期只有约 6 天，续期频繁，因此必须理解 Let's Encrypt 的限制：
+
+| 限制 | 额度 | 说明 |
+|---|---|---|
+| New Certificates per Exact Set of Identifiers | 5 次 / 7 天 | **同一组标识符**（如 `[134.175.61.80]`）签发的证书数，全局计算、不区分账户 |
+| New Orders per Account | 300 次 / 3 小时 | 账户级 |
+
+好消息是**续期不计入限制**：
+
+- **ARI 续期（Caddy 默认走这条）**：Caddy 2.11 支持 ACME Renewal Info，会按 CA 给出的最优时间窗续期。
+  **ARI 续期豁免所有速率限制**，因此 6 天证书长期运行不会撞限。
+- 所以只要**保持 `/data` 卷持久化、让 Caddy 自己按 ARI 续期**，就不用担心速率限制。
+
+真正会撞限的是「反复删除 `/data` 卷重新申请」——每次都是全新订单而非续期，7 天内 5 次就打满。
+这也正是上面强调 staging 调试后要删卷、而生产环境不要随意删卷的原因。
 
 ---
 
-## 六、验证
+## 六、从 staging 切换到生产环境（重要，容易踩坑）
+
+先用 staging 验证流程是推荐做法。但**切换到生产环境时必须删掉 `/data` 卷**：
+
+```bash
+# 1) 停掉并删除容器
+docker rm -f ghcr-proxy
+
+# 2) 删除持久化卷（丢弃 staging 账户与证书）
+docker volume rm ghcr-proxy-data
+
+# 3) 不加 ACME_CA，重新启动 → 会向生产环境申请
+#    注意：Caddy 的存储里若已有 staging 证书，它会直接复用、不会重新申请，
+#    所以第 2 步不能省。
+docker run -d --name ghcr-proxy --restart unless-stopped \
+  -p 80:80 -p 443:443 -p 5999:5999 \
+  -v ghcr-proxy-data:/data \
+  registry.cn-hangzhou.aliyuncs.com/jcleng/gitbuild-ghcr-proxy:latest
+
+# 4) 确认 issuer 已是生产 CA
+docker logs -f ghcr-proxy | grep -iE "obtaining certificate|certificate obtained|acme-v02|staging"
+```
+
+预期日志中的 URL 由 `acme-staging-v02.api.letsencrypt.org` 变为 `acme-v02.api.letsencrypt.org`：
+
+```
+"msg":"certificate obtained successfully","identifier":"134.175.61.80",
+"issuer":"acme-v02.api.letsencrypt.org-directory"
+```
+
+> `issuer` 后缀是 `-directory` 是正常现象（Caddy 用目录 URL 的主机名标识 issuer），
+> 只要主机名是 `acme-v02.api.letsencrypt.org` 就说明拿到的是生产证书。
+
+> 删卷会消耗一次「5 次 / 7 天」额度。若已多次删卷重建，可先查额度用量：
+> <https://crt.sh/?q=134.175.61.80>
+
+---
+
+## 七、验证
 
 ### 1. 证书是否已由公网 CA 签发
 
@@ -255,12 +312,12 @@ curl -sI -H "Authorization: Bearer $TOKEN" \
 ### 4. 真实拉取
 
 ```bash
-docker pull 134.175.61.80:5999/jcleng/opencode-free-provider:latest
+docker pull 134.175.61.80/jcleng/opencode-free-provider:latest
 ```
 
 ---
 
-## 七、常见问题
+## 八、常见问题
 
 | 现象 | 原因 / 解决 |
 |---|---|
@@ -268,7 +325,7 @@ docker pull 134.175.61.80:5999/jcleng/opencode-free-provider:latest
 | 日志 `cannot have public IP certificate` | Caddy 版本 < 2.11，或 profile 未设为 `shortlived` |
 | 日志 `unable to get ACME profile ... not advertised` | ACME 服务器不支持 profiles。确认用的是 Let's Encrypt，或升级 Caddy |
 | ACME 一直失败 / 超时 | 80、443 端口没对公网放行（安全组/防火墙）。裸 IP 证书只能用 http-01/tls-alpn-01 验证 |
-| `too many certificates already issued` | 触发 LE 速率限制。改用 staging 调试；务必持久化 `/data` 卷避免重复申请 |
+| `too many certificates already issued` | 触发 LE 速率限制（5 次 / 7 天 / 同一组标识符）。改用 staging 调试；**务必持久化 `/data` 卷**，让 Caddy 走 ARI 续期（豁免限流）。注意删卷重建=全新订单，会消耗额度 |
 | `x509: certificate signed by unknown authority` | 证书是自签或 staging 签发的。确认 issuer 是 Let's Encrypt 生产 CA |
 | `http: server gave HTTP response to HTTPS client` | 客户端访问的是 HTTP 端口，改用 `https://` + 5999 |
 | `dial tcp 127.0.0.1:443: connection refused` | realm 丢端口。确认用 `{http.request.hostport}` |
@@ -280,7 +337,7 @@ docker pull 134.175.61.80:5999/jcleng/opencode-free-provider:latest
 
 ---
 
-## 八、网络异常时让代理走上游代理
+## 九、网络异常时让代理走上游代理
 
 若代理容器无法直连外网（日志出现 `lookup ghcr.io: i/o timeout`、`502`），
 Caddy 的 `reverse_proxy` 默认不读 `HTTP_PROXY` 环境变量，需要显式配置：
