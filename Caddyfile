@@ -1,0 +1,34 @@
+# ghcr.io 反向代理（Docker Registry pull-through proxy）
+#
+# 用途：让 Docker 通过 http://<host>:5999/<owner>/<image>:<tag> 拉取 ghcr.io 镜像
+# 例：ghcr.io/jcleng/opencode-free-provider:latest
+#  -> 134.175.61.80:5999/jcleng/opencode-free-provider:latest
+#
+# 关键点：ghcr.io 返回 401 时带有 WWW-Authenticate: Bearer realm="https://ghcr.io/token"
+# 若不改写，客户端会直接去访问 https://ghcr.io/token（绕过代理）。
+# 因此把 realm 重写为本代理地址，让 token 请求也走代理。
+
+:5999 {
+	# 1) token 端点：原样转发到 ghcr.io（ghcr.io 的 token 端点会忽略 service 参数，
+	#    因此即使客户端传 service=<本代理地址> 也能正常签发 token）
+	handle /token* {
+		reverse_proxy https://ghcr.io {
+			header_up Host ghcr.io
+		}
+	}
+
+	# 2) 其余全部按 Docker Registry v2 协议转发到 ghcr.io
+	handle {
+		reverse_proxy https://ghcr.io {
+			header_up Host ghcr.io
+			# 把上游的认证 realm 改写为本代理，保证 token 请求不绕过代理
+			# {http.request.hostport} 会保留端口（{http.request.host} 会丢端口，导致 401）
+			header_down WWW-Authenticate "https://ghcr.io/token" "http://{http.request.hostport}/token"
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
